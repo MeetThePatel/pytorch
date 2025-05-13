@@ -1,5 +1,6 @@
 # mypy: allow-untyped-defs
 r"""Implementation for the RMSprop algorithm."""
+
 from typing import cast, Optional, Union
 
 import torch
@@ -18,6 +19,7 @@ from .optimizer import (
     _to_scalar,
     _use_grad_for_differentiable,
     _view_as_real,
+    DeviceDict,
     Optimizer,
     ParamsT,
 )
@@ -40,6 +42,7 @@ class RMSprop(Optimizer):  # noqa: D101
         foreach: Optional[bool] = None,
         maximize: bool = False,
         differentiable: bool = False,
+        fused: Optional[bool] = None,
     ):  # noqa: D107
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
@@ -65,11 +68,22 @@ class RMSprop(Optimizer):  # noqa: D101
             foreach=foreach,
             maximize=maximize,
             differentiable=differentiable,
+            fused=fused,
         )
         super().__init__(params, defaults)
 
+        if fused:
+            if differentiable:
+                raise RuntimeError("`fused` does not support `differentiable`")
+            if foreach:
+                raise RuntimeError("`fused` and `foreach` cannot be `True` together.")
+            self._need_device_dtype_check_for_fused = True
+            self._step_supports_amp_scaling = True
+
     def __setstate__(self, state):  # noqa: D105
         super().__setstate__(state)
+
+        fused = None
         for group in self.param_groups:
             group.setdefault("momentum", 0)
             group.setdefault("centered", False)
@@ -77,15 +91,19 @@ class RMSprop(Optimizer):  # noqa: D101
             group.setdefault("maximize", False)
             group.setdefault("differentiable", False)
             group.setdefault("capturable", False)
+            fused = group.setdefault("fused", None)
+
             for p in group["params"]:
                 p_state = self.state.get(p, [])
                 if len(p_state) != 0 and not torch.is_tensor(p_state["step"]):
                     step_val = float(p_state["step"])
                     p_state["step"] = (
                         torch.tensor(
-                            step_val, dtype=_get_scalar_dtype(), device=p.device
+                            step_val,
+                            dtype=_get_scalar_dtype(is_fused=fused),
+                            device=p.device,
                         )
-                        if group["capturable"]
+                        if group["fused"] or group["capturable"]
                         else torch.tensor(step_val, dtype=_get_scalar_dtype())
                     )
 
@@ -115,8 +133,12 @@ class RMSprop(Optimizer):  # noqa: D101
             # State initialization
             if len(state) == 0:
                 state["step"] = (
-                    torch.zeros((), dtype=_get_scalar_dtype(), device=p.device)
-                    if group["capturable"]
+                    torch.zeros(
+                        (),
+                        dtype=_get_scalar_dtype(is_fused=group["fused"]),
+                        device=p.device,
+                    )
+                    if group["capturable"] or group["fused"]
                     else torch.zeros((), dtype=_get_scalar_dtype())
                 )
                 state["square_avg"] = torch.zeros_like(
@@ -187,6 +209,7 @@ class RMSprop(Optimizer):  # noqa: D101
                 momentum=group["momentum"],
                 centered=group["centered"],
                 foreach=group["foreach"],
+                fused=group["fused"],
                 maximize=group["maximize"],
                 differentiable=group["differentiable"],
                 capturable=group["capturable"],
@@ -292,7 +315,9 @@ def _single_tensor_rmsprop(
             assert (
                 param.device.type == step.device.type
                 and param.device.type in capturable_supported_devices
-            ), f"If capturable=True, params and state_steps must be on supported devices: {capturable_supported_devices}."
+            ), (
+                f"If capturable=True, params and state_steps must be on supported devices: {capturable_supported_devices}."
+            )
 
         grad = grads[i]
         grad = grad if not maximize else -grad
@@ -366,7 +391,9 @@ def _multi_tensor_rmsprop(
             p.device.type == step.device.type
             and p.device.type in capturable_supported_devices
             for p, step in zip(params, state_steps)
-        ), f"If capturable=True, params and state_steps must be on supported devices: {capturable_supported_devices}."
+        ), (
+            f"If capturable=True, params and state_steps must be on supported devices: {capturable_supported_devices}."
+        )
 
     lr = _to_scalar(lr)
 
@@ -465,6 +492,38 @@ def _multi_tensor_rmsprop(
                 torch._foreach_addcdiv_(grouped_params, grouped_grads, avg, value=-lr)
 
 
+def _fused_rmsprop(
+    params: list[Tensor],
+    grads: list[Tensor],
+    square_avgs: list[Tensor],
+    grad_avgs: list[Tensor],
+    momentum_buffer_list: list[Tensor],
+    state_steps: list[Tensor],
+    lr: float,
+    alpha: float,
+    eps: float,
+    weight_decay: float,
+    momentum: float,
+    centered: bool,
+    maximize: bool,
+    capturable: bool,
+    differentiable: bool,
+    has_complex: bool,
+):
+    if not params:
+        return
+    if has_complex:
+        raise RuntimeError("`fused` does not support complex param")
+    if differentiable:
+        raise RuntimeError(
+            "RMSProp with fused=True does not support differentiable=True"
+        )
+
+    grad_scale_dict: DeviceDict = (
+        {grad_scale.device: grad_scale} if grad_scale is not None else {}
+    )
+
+
 @_disable_dynamo_if_unsupported(single_tensor_fn=_single_tensor_rmsprop)
 def rmsprop(
     params: list[Tensor],
@@ -480,6 +539,7 @@ def rmsprop(
     differentiable: bool = False,
     capturable: bool = False,
     has_complex: bool = False,
+    fused: Optional[bool] = None,
     *,
     lr: float,
     alpha: float,
@@ -501,15 +561,23 @@ def rmsprop(
             "API has changed, `state_steps` argument must contain a list of singleton tensors"
         )
 
-    if foreach is None:
+    if fused is None and foreach is None:
         _, foreach = _default_to_fused_or_foreach(
             params, differentiable, use_fused=False
         )
+    if fused is None:
+        fused = False
+    if foreach is None:
+        foreach = False
 
     if foreach and torch.jit.is_scripting():
         raise RuntimeError("torch.jit.script not supported with foreach optimizers")
+    if fused and torch.jit.is_scripting():
+        raise RuntimeError("torch.jit.script not supported with fused optimizers")
 
-    if foreach and not torch.jit.is_scripting():
+    if fused and not torch.jit.is_scripting():
+        func = _fused_rmsprop
+    elif foreach and not torch.jit.is_scripting():
         func = _multi_tensor_rmsprop
     else:
         func = _single_tensor_rmsprop
